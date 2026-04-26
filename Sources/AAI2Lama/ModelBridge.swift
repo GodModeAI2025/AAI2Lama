@@ -38,6 +38,14 @@ enum BridgeError: Error, CustomStringConvertible {
 }
 
 enum ModelBridge {
+    static var contextSize: Int {
+        SystemLanguageModel.default.contextSize
+    }
+
+    static var maxInputTokens: Int {
+        contextSize - Wire.reservedOutputTokens
+    }
+
     static func ensureAvailable() throws {
         let model = SystemLanguageModel.default
         switch model.availability {
@@ -191,7 +199,7 @@ enum ModelBridge {
 
     static func respond(prompt: String, options: BridgeOptions) async throws -> BridgeResult {
         let instructions = combineInstructions(options)
-        let trimmedPrompt = truncateToFit(prompt: prompt, instructions: instructions)
+        let trimmedPrompt = await truncateToFit(prompt: prompt, instructions: instructions)
         let session = makeSession(instructions: instructions)
         let raw: String
         do {
@@ -221,10 +229,10 @@ enum ModelBridge {
         -> AsyncThrowingStream<StreamChunk, Error>
     {
         let instructions = combineInstructions(options)
-        let trimmedPrompt = truncateToFit(prompt: prompt, instructions: instructions)
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
+                    let trimmedPrompt = await truncateToFit(prompt: prompt, instructions: instructions)
                     let session = makeSession(instructions: instructions)
                     var last = ""
                     let s = session.streamResponse(to: trimmedPrompt)
@@ -298,17 +306,18 @@ enum ModelBridge {
 
     // MARK: - Helpers
 
-    static func truncateToFit(prompt: String, instructions: String?) -> String {
-        let instructionTokens = estimateTokens(instructions ?? "")
-        let budget = Wire.maxInputTokens - instructionTokens
+    static func truncateToFit(prompt: String, instructions: String?) async -> String {
+        let instructionTokens = await countTokens(instructions ?? "")
+        let budget = maxInputTokens - instructionTokens
         if budget <= 0 { return String(prompt.prefix(100)) }
 
-        let promptTokens = estimateTokens(prompt)
+        let promptTokens = await countTokens(prompt)
         if promptTokens <= budget { return prompt }
 
         let blocks = prompt.components(separatedBy: "\n\n")
         if blocks.count <= 1 {
-            let charBudget = budget * 4
+            let ratio = Double(budget) / Double(max(1, promptTokens))
+            let charBudget = Int(Double(prompt.count) * ratio)
             let start = prompt.index(prompt.endIndex, offsetBy: -min(charBudget, prompt.count))
             return "[...truncated...]\n\n" + prompt[start...]
         }
@@ -316,7 +325,7 @@ enum ModelBridge {
         var kept: [String] = []
         var usedTokens = 0
         for block in blocks.reversed() {
-            let blockTokens = estimateTokens(block)
+            let blockTokens = await countTokens(block)
             if usedTokens + blockTokens > budget && !kept.isEmpty { break }
             kept.insert(block, at: 0)
             usedTokens += blockTokens
@@ -326,6 +335,16 @@ enum ModelBridge {
             kept.insert("[...earlier messages truncated...]", at: 0)
         }
         return kept.joined(separator: "\n\n")
+    }
+
+    static func countTokens(_ s: String) async -> Int {
+        if s.isEmpty { return 0 }
+        if #available(macOS 26.4, *) {
+            if let count = try? await SystemLanguageModel.default.tokenCount(for: s) {
+                return count
+            }
+        }
+        return estimateTokens(s)
     }
 
     static func estimateTokens(_ s: String) -> Int {

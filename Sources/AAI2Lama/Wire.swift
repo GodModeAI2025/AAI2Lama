@@ -13,9 +13,7 @@ enum Wire {
     static func nowISO8601() -> String { iso8601Style.format(.now) }
     static func nowEpoch() -> Int { Int(Date.now.timeIntervalSince1970) }
 
-    static let maxContextTokens = 4096
     static let reservedOutputTokens = 800
-    static var maxInputTokens: Int { maxContextTokens - reservedOutputTokens }
 
     static func normalizeModel(_ name: String?) -> String { modelTag }
 }
