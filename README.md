@@ -145,7 +145,16 @@ curl -X POST http://127.0.0.1:11435/v1/embeddings \
 
 ### Context Window Management
 
-Apple Intelligence has a ~4K token context window. AAI2Lama automatically truncates long conversations, keeping the most recent messages and system prompt. A `[...earlier messages truncated...]` marker indicates when truncation occurred.
+Apple Intelligence has a ~4K token context window (queried at runtime via `SystemLanguageModel.default.contextSize`). AAI2Lama automatically truncates long conversations, keeping the most recent messages and system prompt. A `[...earlier messages truncated...]` marker indicates when truncation occurred.
+
+On macOS 26.4+, exact token counting is used via Apple's native `tokenCount(for:)` API. On older versions, a conservative heuristic is used as fallback.
+
+### No Private Cloud Compute
+
+Apple has confirmed that the Foundation Models framework is **strictly on-device**. Private Cloud Compute (PCC) is used only by Apple's own first-party features (Siri, etc.) — there is no developer API to access it. This means:
+- The model is always the on-device ~3B model
+- Context window is fixed at ~4K tokens with no cloud fallback
+- There is no way to route to a larger server-side model
 
 ## Limitations
 
@@ -156,6 +165,21 @@ Apple Intelligence has a ~4K token context window. AAI2Lama automatically trunca
 - **No local/cloud routing control** — Apple decides whether to use on-device or Private Cloud Compute; there is no API to override this
 - **Tool calling is prompt-engineered** — works well for simple tools but may be unreliable for complex schemas
 - **Token counts are estimates** — Apple does not expose exact token counts; values are approximated
+
+## Architecture Decisions
+
+Detailed architecture decision records are available in the [ADR/](ADR/) directory:
+
+| ADR | Decision |
+|---|---|
+| [001](ADR/001-ollama-api-as-primary-interface.md) | Ollama API as primary interface |
+| [002](ADR/002-hummingbird-as-http-server.md) | Hummingbird 2 as HTTP server |
+| [003](ADR/003-prompt-based-tool-calling.md) | Prompt-based tool calling |
+| [004](ADR/004-proxy-mode-for-ollama-integration.md) | Proxy mode for Ollama integration |
+| [005](ADR/005-context-window-management.md) | Automatic context truncation |
+| [006](ADR/006-on-device-only-no-pcc.md) | On-device only, no PCC access |
+| [007](ADR/007-nlemebdding-for-embeddings.md) | NLEmbedding for text embeddings |
+| [008](ADR/008-streaming-text-filter-design.md) | Stateful streaming text filter |
 
 ## Architecture
 
