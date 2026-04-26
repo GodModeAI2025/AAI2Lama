@@ -183,7 +183,7 @@ Apple Intelligence has a ~4K token context window. AAI2Lama automatically trunca
 
 ## License
 
-MIT
+Apache 2.0
 
 ## Credits
 
