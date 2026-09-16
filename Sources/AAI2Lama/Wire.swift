@@ -209,6 +209,8 @@ struct OpenAIChatRequest: Decodable {
     let temperature: Double?
     let top_p: Double?
     let max_tokens: Int?
+    let max_completion_tokens: Int?
+    let seed: Int?
     let frequency_penalty: Double?
     let presence_penalty: Double?
     let stop: JSONValue?

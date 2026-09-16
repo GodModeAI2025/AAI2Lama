@@ -140,13 +140,21 @@ private func handleOllamaChat(_ body: ChatRequest) async throws -> Response {
             parametersJSONSchema: $0.function.parameters
         )
     }
-    let options = BridgeOptions(systemInstruction: system, tools: tools)
+    let options = BridgeOptions(
+        systemInstruction: system, tools: tools,
+        sampling: SamplingSettings(ollama: body.options)
+    )
     let model = Wire.normalizeModel(body.model)
 
     if body.stream ?? true {
         return ollamaChatStreamResponse(model: model, prompt: prompt, options: options)
     } else {
-        let result = try await ModelBridge.respond(prompt: prompt, options: options)
+        let result: BridgeResult
+        do {
+            result = try await ModelBridge.respond(prompt: prompt, options: options)
+        } catch {
+            return ollamaError(for: error)
+        }
         let hasTools = !result.toolCalls.isEmpty
         let resp = ChatResponse(
             model: model,
@@ -242,7 +250,7 @@ private func ollamaChatStreamResponse(model: String, prompt: String, options: Br
                 continuation.yield(try ndjson(final))
                 continuation.finish()
             } catch {
-                let err = OllamaErrorFrame(error: String(describing: error))
+                let err = OllamaErrorFrame(error: ModelBridge.classify(error).description)
                 if let buf = try? ndjson(err) { continuation.yield(buf) }
                 continuation.finish()
             }
@@ -274,7 +282,10 @@ private struct OllamaErrorFrame: Encodable {
 // MARK: - Ollama Generate
 
 private func handleOllamaGenerate(_ body: GenerateRequest) async throws -> Response {
-    let options = BridgeOptions(systemInstruction: body.system, tools: [])
+    let options = BridgeOptions(
+        systemInstruction: body.system, tools: [],
+        sampling: SamplingSettings(ollama: body.options)
+    )
     let model = Wire.normalizeModel(body.model)
 
     if body.stream ?? true {
@@ -301,7 +312,7 @@ private func handleOllamaGenerate(_ body: GenerateRequest) async throws -> Respo
                     continuation.yield(try ndjson(final))
                     continuation.finish()
                 } catch {
-                    let err = OllamaErrorFrame(error: String(describing: error))
+                    let err = OllamaErrorFrame(error: ModelBridge.classify(error).description)
                     if let buf = try? ndjson(err) { continuation.yield(buf) }
                     continuation.finish()
                 }
@@ -314,7 +325,12 @@ private func handleOllamaGenerate(_ body: GenerateRequest) async throws -> Respo
             body: ResponseBody(asyncSequence: stream)
         )
     } else {
-        let result = try await ModelBridge.respond(prompt: body.prompt, options: options)
+        let result: BridgeResult
+        do {
+            result = try await ModelBridge.respond(prompt: body.prompt, options: options)
+        } catch {
+            return ollamaError(for: error)
+        }
         let resp = GenerateResponse(
             model: model, createdAt: Wire.nowISO8601(),
             response: result.text, done: true,
@@ -348,14 +364,22 @@ private func handleOpenAIChat(_ body: OpenAIChatRequest) async throws -> Respons
             parametersJSONSchema: $0.function.parameters
         )
     }
-    let options = BridgeOptions(systemInstruction: system, tools: tools)
+    let options = BridgeOptions(
+        systemInstruction: system, tools: tools,
+        sampling: SamplingSettings(openAI: body)
+    )
     let model = Wire.normalizeModel(body.model)
     let id = "chatcmpl-\(ModelBridge.shortID(length: 20))"
 
     if body.stream ?? false {
         return openAIChatStreamResponse(id: id, model: model, prompt: prompt, options: options)
     } else {
-        let result = try await ModelBridge.respond(prompt: prompt, options: options)
+        let result: BridgeResult
+        do {
+            result = try await ModelBridge.respond(prompt: prompt, options: options)
+        } catch {
+            return openAIError(for: error)
+        }
         let hasTools = !result.toolCalls.isEmpty
         let toolCalls = result.toolCalls.map { c in
             OpenAIToolCall(
@@ -503,7 +527,12 @@ private func openAIChatStreamResponse(id: String, model: String, prompt: String,
                 continuation.yield(sseTerminator)
                 continuation.finish()
             } catch {
-                let payload = ["error": ["message": String(describing: error), "type": "bridge_error"]]
+                let failure = ModelBridge.classify(error)
+                let payload = ["error": [
+                    "message": failure.description,
+                    "type": failure.kind.openAIErrorType,
+                    "code": failure.kind.rawValue,
+                ]]
                 if let data = try? JSONSerialization.data(withJSONObject: payload),
                    let s = String(data: data, encoding: .utf8) {
                     continuation.yield(ByteBuffer(string: "data: \(s)\n\n"))
@@ -566,6 +595,28 @@ private func ollamaError(_ message: String, status: HTTPResponse.Status) -> Resp
     let data = (try? sharedEncoder.encode(body)) ?? Data("{\"error\":\"internal\"}".utf8)
     return Response(
         status: status,
+        headers: [.contentType: "application/json"],
+        body: ResponseBody(byteBuffer: ByteBuffer(data: data))
+    )
+}
+
+/// Maps a generation failure to Ollama's `{"error": ...}` body with a matching HTTP status.
+private func ollamaError(for error: Error) -> Response {
+    let failure = ModelBridge.classify(error)
+    return ollamaError(failure.description, status: HTTPResponse.Status(code: failure.kind.httpStatusCode))
+}
+
+/// Maps a generation failure to OpenAI's `{"error": {message, type, code}}` body.
+private func openAIError(for error: Error) -> Response {
+    let failure = ModelBridge.classify(error)
+    let body = OpenAIErrorResponse(error: OpenAIErrorDetail(
+        message: failure.description,
+        type: failure.kind.openAIErrorType,
+        code: failure.kind.rawValue
+    ))
+    let data = (try? sharedEncoder.encode(body)) ?? Data("{\"error\":{\"message\":\"internal\"}}".utf8)
+    return Response(
+        status: HTTPResponse.Status(code: failure.kind.httpStatusCode),
         headers: [.contentType: "application/json"],
         body: ResponseBody(byteBuffer: ByteBuffer(data: data))
     )

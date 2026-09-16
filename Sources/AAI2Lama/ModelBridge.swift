@@ -5,6 +5,7 @@ import FoundationModels
 struct BridgeOptions {
     let systemInstruction: String?
     let tools: [ToolSpec]
+    var sampling: SamplingSettings = .none
 }
 
 struct ToolSpec {
@@ -29,10 +30,19 @@ struct BridgeResult {
 enum BridgeError: Error, CustomStringConvertible {
     case modelUnavailable(String)
     case generationFailed(String)
+    case generation(GenerationFailureKind, String)
     var description: String {
         switch self {
         case .modelUnavailable(let r): return "Apple Intelligence not available: \(r)"
         case .generationFailed(let r): return "Generation failed: \(r)"
+        case .generation(let kind, let r): return "Generation failed (\(kind.rawValue)): \(r)"
+        }
+    }
+    var kind: GenerationFailureKind {
+        switch self {
+        case .modelUnavailable: return .modelUnavailable
+        case .generationFailed: return .other
+        case .generation(let kind, _): return kind
         }
     }
 }
@@ -42,8 +52,46 @@ enum ModelBridge {
         SystemLanguageModel.default.contextSize
     }
 
-    static var maxInputTokens: Int {
-        contextSize - Wire.reservedOutputTokens
+    static func maxInputTokens(sampling: SamplingSettings) -> Int {
+        contextSize - sampling.reservedOutputTokens(contextSize: contextSize)
+    }
+
+    static func generationOptions(for sampling: SamplingSettings) -> GenerationOptions {
+        let mode: GenerationOptions.SamplingMode?
+        switch sampling.mode {
+        case .default: mode = nil
+        case .topK(let k): mode = .random(top: k, seed: sampling.seed)
+        case .topP(let p): mode = .random(probabilityThreshold: p, seed: sampling.seed)
+        }
+        return GenerationOptions(
+            sampling: mode,
+            temperature: sampling.temperature,
+            maximumResponseTokens: sampling.maximumResponseTokens
+        )
+    }
+
+    /// Keeps the framework's failure reason instead of flattening it into one opaque 500.
+    static func classify(_ error: Error) -> BridgeError {
+        if let bridge = error as? BridgeError { return bridge }
+        if error is CancellationError {
+            return .generation(.cancelled, "request cancelled")
+        }
+        guard let generationError = error as? LanguageModelSession.GenerationError else {
+            return .generation(.other, String(describing: error))
+        }
+        let kind: GenerationFailureKind
+        switch generationError {
+        case .exceededContextWindowSize: kind = .contextWindowExceeded
+        case .assetsUnavailable: kind = .assetsUnavailable
+        case .guardrailViolation: kind = .guardrailViolation
+        case .refusal: kind = .refusal
+        case .unsupportedLanguageOrLocale: kind = .unsupportedLanguage
+        case .rateLimited: kind = .rateLimited
+        case .concurrentRequests: kind = .concurrentRequests
+        case .decodingFailure, .unsupportedGuide: kind = .decodingFailure
+        @unknown default: kind = .other
+        }
+        return .generation(kind, generationError.errorDescription ?? String(describing: generationError))
     }
 
     static func ensureAvailable() throws {
@@ -199,14 +247,16 @@ enum ModelBridge {
 
     static func respond(prompt: String, options: BridgeOptions) async throws -> BridgeResult {
         let instructions = combineInstructions(options)
-        let trimmedPrompt = await truncateToFit(prompt: prompt, instructions: instructions)
+        let trimmedPrompt = await truncateToFit(prompt: prompt, instructions: instructions, sampling: options.sampling)
         let session = makeSession(instructions: instructions)
         let raw: String
         do {
-            let response = try await session.respond(to: trimmedPrompt)
+            let response = try await session.respond(
+                to: trimmedPrompt, options: generationOptions(for: options.sampling)
+            )
             raw = response.content
         } catch {
-            throw BridgeError.generationFailed(String(describing: error))
+            throw classify(error)
         }
         let (calls, cleaned) = extractAndStrip(from: raw)
         let promptText = (instructions ?? "") + "\n" + prompt
@@ -232,10 +282,12 @@ enum ModelBridge {
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let trimmedPrompt = await truncateToFit(prompt: prompt, instructions: instructions)
+                    let trimmedPrompt = await truncateToFit(prompt: prompt, instructions: instructions, sampling: options.sampling)
                     let session = makeSession(instructions: instructions)
                     var last = ""
-                    let s = session.streamResponse(to: trimmedPrompt)
+                    let s = session.streamResponse(
+                        to: trimmedPrompt, options: generationOptions(for: options.sampling)
+                    )
                     for try await partial in s {
                         let snap = stringFromPartial(partial)
                         if snap.count >= last.count, snap.hasPrefix(last) {
@@ -251,7 +303,7 @@ enum ModelBridge {
                     }
                     continuation.finish()
                 } catch {
-                    continuation.finish(throwing: BridgeError.generationFailed(String(describing: error)))
+                    continuation.finish(throwing: classify(error))
                 }
             }
             continuation.onTermination = { _ in task.cancel() }
@@ -306,9 +358,9 @@ enum ModelBridge {
 
     // MARK: - Helpers
 
-    static func truncateToFit(prompt: String, instructions: String?) async -> String {
+    static func truncateToFit(prompt: String, instructions: String?, sampling: SamplingSettings = .none) async -> String {
         let instructionTokens = await countTokens(instructions ?? "")
-        let budget = maxInputTokens - instructionTokens
+        let budget = maxInputTokens(sampling: sampling) - instructionTokens
         if budget <= 0 { return String(prompt.prefix(100)) }
 
         let promptTokens = await countTokens(prompt)

@@ -9,6 +9,8 @@
 - **Ollama API** — `/api/chat`, `/api/generate`, `/api/tags`, `/api/embed`, `/api/show`, `/api/ps`
 - **OpenAI API** — `/v1/chat/completions`, `/v1/models`, `/v1/embeddings`
 - Streaming (NDJSON + SSE), tool calling, embeddings (via `NLEmbedding`)
+- Sampling options (`temperature`, max tokens, `top_p`/`top_k`, `seed`) mapped to Apple's `GenerationOptions`
+- Model failures (context overflow, guardrails, rate limits) returned as distinct HTTP errors
 - **Proxy mode** — sits in front of real Ollama, merges apple-intelligence with your existing models
 - Automatic context truncation for Apple Intelligence's 4K token window
 - CORS enabled for browser-based clients
@@ -143,6 +145,40 @@ curl -X POST http://127.0.0.1:11435/v1/embeddings \
   -d '{"model":"apple-intelligence","input":["Hello","World"]}'
 ```
 
+### Sampling Options
+
+Ollama `options` and OpenAI request fields are passed to Apple's `GenerationOptions`:
+
+| Ollama `options` | OpenAI field | Apple `GenerationOptions` |
+|---|---|---|
+| `temperature` | `temperature` | `temperature` (clamped to 0–2) |
+| `num_predict` | `max_completion_tokens` / `max_tokens` | `maximumResponseTokens` (`-1`/`0` = no limit) |
+| `top_p` | `top_p` | `.random(probabilityThreshold:seed:)` when 0 < p < 1 |
+| `top_k` | — | `.random(top:seed:)` when k ≥ 1 and no usable `top_p` |
+| `seed` | `seed` | seed of the random sampling mode; ignored without `top_p`/`top_k` |
+
+Apple accepts only one sampling mode, so `top_p` takes precedence over `top_k`. `stop`, `repeat_penalty`, `frequency_penalty` and `presence_penalty` have no Foundation Models equivalent and are ignored. A response limit above the default 800-token output reserve also enlarges the reserve used for truncation (at most half the context window).
+
+```bash
+curl -X POST http://127.0.0.1:11435/api/generate -d '{
+  "prompt": "Name three rivers.", "stream": false,
+  "options": {"temperature": 0.2, "num_predict": 120, "top_k": 5, "seed": 42}
+}'
+```
+
+### Error Responses
+
+Failures from `LanguageModelSession` keep their cause instead of becoming a generic 500:
+
+| Cause | HTTP status | OpenAI `error.code` |
+|---|---|---|
+| Context window exceeded, guardrail violation, refusal, unsupported language | 400 | `context_length_exceeded`, `guardrail_violation`, `refusal`, `unsupported_language` |
+| Rate limited, concurrent requests | 429 | `rate_limited`, `concurrent_requests` |
+| Model assets unavailable | 503 | `assets_unavailable` |
+| Other generation failures | 500 | `generation_failed` |
+
+Ollama endpoints return `{"error": "..."}`; OpenAI endpoints return `{"error": {"message", "type", "code"}}`. Streaming responses have already sent status 200, so the error arrives as a final NDJSON/SSE frame with the same message.
+
 ### Context Window Management
 
 Apple Intelligence has a ~4K token context window (queried at runtime via `SystemLanguageModel.default.contextSize`). AAI2Lama automatically truncates long conversations, keeping the most recent messages and system prompt. A `[...earlier messages truncated...]` marker indicates when truncation occurred.
@@ -162,9 +198,9 @@ Apple has confirmed that the Foundation Models framework is **strictly on-device
 - **Single model** — Apple Intelligence exposes one model; pull/delete/create operations are no-ops (proxied in proxy mode)
 - **4K context window** — significantly smaller than typical Ollama models; automatic truncation helps but long conversations lose early context
 - **No image input** — Foundation Models API is text-only
-- **No local/cloud routing control** — Apple decides whether to use on-device or Private Cloud Compute; there is no API to override this
 - **Tool calling is prompt-engineered** — works well for simple tools but may be unreliable for complex schemas
-- **Token counts are estimates** — Apple does not expose exact token counts; values are approximated
+- **Usage counts are estimates** — truncation uses exact counts on macOS 26.4+, but `prompt_eval_count`/`eval_count` and OpenAI `usage` are approximated
+- **Partial sampling control** — no stop sequences or repetition penalties; see [Sampling Options](#sampling-options)
 
 ## Architecture Decisions
 
@@ -180,6 +216,7 @@ Detailed architecture decision records are available in the [ADR/](ADR/) directo
 | [006](ADR/006-on-device-only-no-pcc.md) | On-device only, no PCC access |
 | [007](ADR/007-nlemebdding-for-embeddings.md) | NLEmbedding for text embeddings |
 | [008](ADR/008-streaming-text-filter-design.md) | Stateful streaming text filter |
+| [009](ADR/009-generation-options-and-error-mapping.md) | Generation options and error mapping |
 
 ## Architecture
 
