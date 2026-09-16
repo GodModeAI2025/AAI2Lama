@@ -20,14 +20,15 @@ struct SamplingSettings: Equatable {
     /// Normalises raw client values. Out-of-range values are dropped or clamped rather than
     /// rejected, because clients such as Open WebUI send their own defaults on every request.
     ///
-    /// - temperature is clamped to 0...2.
+    /// - temperature is clamped to 0...1, the range `GenerationOptions.temperature` accepts
+    ///   (OpenAI allows up to 2; higher values are capped, not rejected).
     /// - maxTokens <= 0 (Ollama's `-1` = unlimited) means "no explicit limit".
     /// - Apple's API accepts one sampling mode: `top_p` in (0, 1) wins over `top_k` >= 1.
     ///   `top_p` >= 1 and `top_k` <= 0 are Ollama's "disabled" values and fall back to default.
     /// - A seed only exists for random sampling, so it is ignored in default mode.
     init(temperature: Double? = nil, maxTokens: Int? = nil,
          topP: Double? = nil, topK: Int? = nil, seed: Int? = nil) {
-        self.temperature = temperature.map { min(max($0, 0), 2) }
+        self.temperature = temperature.map { min(max($0, 0), 1) }
         self.maximumResponseTokens = maxTokens.flatMap { $0 > 0 ? $0 : nil }
         if let p = topP, p > 0, p < 1 {
             mode = .topP(p)

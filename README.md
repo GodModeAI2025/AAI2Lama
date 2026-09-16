@@ -151,7 +151,7 @@ Ollama `options` and OpenAI request fields are passed to Apple's `GenerationOpti
 
 | Ollama `options` | OpenAI field | Apple `GenerationOptions` |
 |---|---|---|
-| `temperature` | `temperature` | `temperature` (clamped to 0–2) |
+| `temperature` | `temperature` | `temperature` (clamped to 0–1, Apple's accepted range) |
 | `num_predict` | `max_completion_tokens` / `max_tokens` | `maximumResponseTokens` (`-1`/`0` = no limit) |
 | `top_p` | `top_p` | `.random(probabilityThreshold:seed:)` when 0 < p < 1 |
 | `top_k` | — | `.random(top:seed:)` when k ≥ 1 and no usable `top_p` |

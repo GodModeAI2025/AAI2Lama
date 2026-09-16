@@ -22,7 +22,7 @@ Options considered:
 ## Implementation
 
 1. `Sampling.swift` holds `SamplingSettings` and `GenerationFailureKind` without importing `FoundationModels`
-2. Temperature is clamped to 0–2; token limits ≤ 0 mean "no limit"
+2. Temperature is clamped to 0–1 (the documented range of `GenerationOptions.temperature`; OpenAI allows up to 2); token limits ≤ 0 mean "no limit"
 3. `top_p` in (0, 1) wins over `top_k` ≥ 1, because Apple accepts one sampling mode; a seed is only used with a random mode
 4. The truncation reserve grows with an explicit response limit, capped at half the context window (see ADR-005)
 5. `ModelBridge.classify(_:)` maps framework errors: client-fixable → 400, rate limits → 429, missing assets → 503, everything else → 500
