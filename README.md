@@ -7,7 +7,7 @@
 - Runs Apple's on-device ~3B Foundation Model via the `FoundationModels` framework
 - Exposes it as `apple-intelligence:latest` through standard APIs
 - **Ollama API** — `/api/chat`, `/api/generate`, `/api/tags`, `/api/embed`, `/api/show`, `/api/ps`
-- **OpenAI API** — `/v1/chat/completions`, `/v1/models`, `/v1/embeddings`
+- **OpenAI API** — `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/v1/embeddings`
 - Streaming (NDJSON + SSE), tool calling, embeddings (via `NLEmbedding`)
 - Sampling options (`temperature`, max tokens, `top_p`/`top_k`, `seed`) mapped to Apple's `GenerationOptions`
 - Model failures (context overflow, guardrails, rate limits) returned as distinct HTTP errors
@@ -131,6 +131,30 @@ curl -X POST http://127.0.0.1:11435/api/chat -d '{
 }'
 ```
 
+### Text Completions
+
+`POST /v1/completions` serves OpenAI's text-completion format, the endpoint editor
+extensions use for inline suggestions (Continue, Cursor and anything built on the legacy
+OpenAI completion route). It accepts `prompt` as a string or an array, supports `stream`,
+and takes the same sampling fields as `/v1/chat/completions`.
+
+```bash
+curl -X POST http://127.0.0.1:11435/v1/completions \
+  -d '{"model":"apple-intelligence","prompt":"The capital of France is","max_tokens":16}'
+```
+
+`suffix` (fill-in-the-middle) is supported as well. The on-device model has no
+fill-in-the-middle mode, so the text before and after the cursor is handed to it as an
+explicit instruction:
+
+```bash
+curl -X POST http://127.0.0.1:11435/v1/completions \
+  -d '{"prompt":"func add(a: Int, b: Int) -> Int {\n    ","suffix":"\n}"}'
+```
+
+Expect an instruction-tuned ~3B model, not a code-completion model — the format is
+compatible, the suggestions are as good as Apple Intelligence gets.
+
 ### Embeddings
 
 512-dimensional sentence embeddings via Apple's `NLEmbedding`:
@@ -152,7 +176,7 @@ Ollama `options` and OpenAI request fields are passed to Apple's `GenerationOpti
 | Ollama `options` | OpenAI field | Apple `GenerationOptions` |
 |---|---|---|
 | `temperature` | `temperature` | `temperature` (clamped to 0–1, Apple's accepted range) |
-| `num_predict` | `max_completion_tokens` / `max_tokens` | `maximumResponseTokens` (`-1`/`0` = no limit) |
+| `num_predict` | `max_completion_tokens` / `max_tokens` (`max_tokens` on `/v1/completions`) | `maximumResponseTokens` (`-1`/`0` = no limit) |
 | `top_p` | `top_p` | `.random(probabilityThreshold:seed:)` when 0 < p < 1 |
 | `top_k` | — | `.random(top:seed:)` when k ≥ 1 and no usable `top_p` |
 | `seed` | `seed` | seed of the random sampling mode; ignored without `top_p`/`top_k` |
@@ -217,6 +241,7 @@ Detailed architecture decision records are available in the [ADR/](ADR/) directo
 | [007](ADR/007-nlemebdding-for-embeddings.md) | NLEmbedding for text embeddings |
 | [008](ADR/008-streaming-text-filter-design.md) | Stateful streaming text filter |
 | [009](ADR/009-generation-options-and-error-mapping.md) | Generation options and error mapping |
+| [010](ADR/010-openai-text-completions.md) | OpenAI text-completion endpoint |
 
 ## Architecture
 

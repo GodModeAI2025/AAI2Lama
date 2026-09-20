@@ -59,6 +59,15 @@ struct SamplingSettings: Equatable {
         )
     }
 
+    init(openAI request: OpenAICompletionRequest) {
+        self.init(
+            temperature: request.temperature,
+            maxTokens: request.max_tokens,
+            topP: request.top_p,
+            seed: request.seed
+        )
+    }
+
     /// Output tokens to keep free when truncating the prompt. A larger explicit response
     /// limit widens the reserve, but never beyond half the context window.
     func reservedOutputTokens(contextSize: Int) -> Int {

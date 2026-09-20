@@ -399,6 +399,66 @@ struct OpenAIModelsResponse: ResponseCodable {
     let data: [OpenAIModelEntry]
 }
 
+// MARK: - OpenAI Text Completions
+
+/// `prompt` accepts a string or an array of strings; batch prompts are joined rather than
+/// rejected, because editor clients occasionally send a single-element array.
+enum CompletionPrompt: Decodable {
+    case single(String)
+    case batch([String])
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if let s = try? c.decode(String.self) { self = .single(s); return }
+        if let a = try? c.decode([String].self) { self = .batch(a); return }
+        throw DecodingError.dataCorruptedError(in: c, debugDescription: "Expected string or [string]")
+    }
+
+    var text: String {
+        switch self {
+        case .single(let s): return s
+        case .batch(let a): return a.joined(separator: "\n")
+        }
+    }
+}
+
+struct OpenAICompletionRequest: Decodable {
+    let model: String?
+    let prompt: CompletionPrompt?
+    let suffix: String?
+    let stream: Bool?
+    let temperature: Double?
+    let top_p: Double?
+    let max_tokens: Int?
+    let seed: Int?
+    let stop: JSONValue?
+    let n: Int?
+    let echo: Bool?
+}
+
+struct OpenAICompletionChoice: Codable {
+    let index: Int
+    let text: String
+    let finish_reason: String?
+}
+
+struct OpenAICompletionResponse: ResponseCodable {
+    let id: String
+    let object: String
+    let created: Int
+    let model: String
+    let choices: [OpenAICompletionChoice]
+    let usage: OpenAIUsage
+}
+
+struct OpenAICompletionChunk: Codable {
+    let id: String
+    let object: String
+    let created: Int
+    let model: String
+    let choices: [OpenAICompletionChoice]
+}
+
 // MARK: - JSONValue (for arbitrary JSON in tool params/args)
 
 enum JSONValue: Codable {

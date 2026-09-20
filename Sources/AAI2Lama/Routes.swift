@@ -122,6 +122,11 @@ enum Routes {
             return try await handleOpenAIChat(body)
         }
 
+        router.post("/v1/completions") { request, context -> Response in
+            let body = try await request.decode(as: OpenAICompletionRequest.self, context: context)
+            return try await handleOpenAICompletion(body)
+        }
+
         router.post("/v1/embeddings") { request, context -> Response in
             let body = try await request.decode(as: OpenAIEmbeddingRequest.self, context: context)
             return try handleOpenAIEmbed(body)
@@ -524,6 +529,110 @@ private func openAIChatStreamResponse(id: String, model: String, prompt: String,
                     )]
                 )
                 continuation.yield(try sse(final))
+                continuation.yield(sseTerminator)
+                continuation.finish()
+            } catch {
+                let failure = ModelBridge.classify(error)
+                let payload = ["error": [
+                    "message": failure.description,
+                    "type": failure.kind.openAIErrorType,
+                    "code": failure.kind.rawValue,
+                ]]
+                if let data = try? JSONSerialization.data(withJSONObject: payload),
+                   let s = String(data: data, encoding: .utf8) {
+                    continuation.yield(ByteBuffer(string: "data: \(s)\n\n"))
+                }
+                continuation.yield(sseTerminator)
+                continuation.finish()
+            }
+        }
+        continuation.onTermination = { _ in task.cancel() }
+    }
+    return Response(
+        status: .ok,
+        headers: [.contentType: "text/event-stream", .cacheControl: "no-cache"],
+        body: ResponseBody(asyncSequence: stream)
+    )
+}
+
+// MARK: - OpenAI Text Completions
+
+private func handleOpenAICompletion(_ body: OpenAICompletionRequest) async throws -> Response {
+    let (system, prompt) = frameCompletionPrompt(body)
+    let options = BridgeOptions(
+        systemInstruction: system, tools: [],
+        sampling: SamplingSettings(openAI: body)
+    )
+    let model = Wire.normalizeModel(body.model)
+    let id = "cmpl-\(ModelBridge.shortID(length: 20))"
+    let prefix = (body.echo ?? false) ? body.prompt?.text ?? "" : ""
+
+    if body.stream ?? false {
+        return openAICompletionStreamResponse(
+            id: id, model: model, prompt: prompt, echo: prefix, options: options
+        )
+    }
+
+    let result: BridgeResult
+    do {
+        result = try await ModelBridge.respond(prompt: prompt, options: options)
+    } catch {
+        return openAIError(for: error)
+    }
+    let resp = OpenAICompletionResponse(
+        id: id,
+        object: "text_completion",
+        created: Wire.nowEpoch(),
+        model: model,
+        choices: [OpenAICompletionChoice(
+            index: 0, text: prefix + result.text, finish_reason: FinishReason.stop
+        )],
+        usage: OpenAIUsage(
+            prompt_tokens: result.promptTokens,
+            completion_tokens: result.completionTokens
+        )
+    )
+    return try jsonResponse(resp)
+}
+
+/// The on-device model follows instructions; it has no fill-in-the-middle mode. A request
+/// that carries `suffix` — what editor clients send for inline completion — is therefore
+/// turned into an explicit instruction instead of being passed through as raw text.
+private func frameCompletionPrompt(_ body: OpenAICompletionRequest) -> (system: String?, prompt: String) {
+    let text = body.prompt?.text ?? ""
+    guard let suffix = body.suffix, !suffix.isEmpty else {
+        return (nil, text)
+    }
+    let system = """
+        Complete the text at the cursor. Answer with the missing passage only — \
+        no explanation, and do not repeat the text around the cursor.
+        """
+    return (system, "[Before the cursor]\n\(text)\n\n[After the cursor]\n\(suffix)")
+}
+
+private func openAICompletionStreamResponse(
+    id: String, model: String, prompt: String, echo: String, options: BridgeOptions
+) -> Response {
+    let created = Wire.nowEpoch()
+    let stream = AsyncThrowingStream<ByteBuffer, Error> { continuation in
+        let task = Task {
+            func chunk(_ text: String, finish: String?) -> OpenAICompletionChunk {
+                OpenAICompletionChunk(
+                    id: id, object: "text_completion",
+                    created: created, model: model,
+                    choices: [OpenAICompletionChoice(index: 0, text: text, finish_reason: finish)]
+                )
+            }
+            do {
+                if !echo.isEmpty {
+                    continuation.yield(try sse(chunk(echo, finish: nil)))
+                }
+                for try await delta in ModelBridge.stream(prompt: prompt, options: options) {
+                    if !delta.textDelta.isEmpty {
+                        continuation.yield(try sse(chunk(delta.textDelta, finish: nil)))
+                    }
+                }
+                continuation.yield(try sse(chunk("", finish: FinishReason.stop)))
                 continuation.yield(sseTerminator)
                 continuation.finish()
             } catch {
