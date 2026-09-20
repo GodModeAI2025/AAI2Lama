@@ -122,6 +122,11 @@ enum Routes {
             return try await handleOpenAIChat(body)
         }
 
+        router.post("/v1/completions") { request, context -> Response in
+            let body = try await request.decode(as: OpenAICompletionRequest.self, context: context)
+            return try await handleOpenAICompletion(body)
+        }
+
         router.post("/v1/embeddings") { request, context -> Response in
             let body = try await request.decode(as: OpenAIEmbeddingRequest.self, context: context)
             return try handleOpenAIEmbed(body)
@@ -550,6 +555,208 @@ private func openAIChatStreamResponse(id: String, model: String, prompt: String,
     )
 }
 
+// MARK: - OpenAI Text Completions
+
+private func handleOpenAICompletion(_ body: OpenAICompletionRequest) async throws -> Response {
+    if let rejection = unsupportedCompletionField(body) { return rejection }
+
+    let (system, prompt) = frameCompletionPrompt(body)
+    let options = BridgeOptions(
+        systemInstruction: system, tools: [],
+        sampling: SamplingSettings(openAI: body)
+    )
+    let model = Wire.normalizeModel(body.model)
+    let id = "cmpl-\(ModelBridge.shortID(length: 20))"
+    let prefix = (body.echo ?? false) ? body.prompt?.text ?? "" : ""
+    let stops = body.stop?.values ?? []
+
+    if body.stream ?? false {
+        return openAICompletionStreamResponse(
+            id: id, model: model, prompt: prompt, echo: prefix, stops: stops, options: options
+        )
+    }
+
+    let result: BridgeResult
+    do {
+        result = try await ModelBridge.respond(prompt: prompt, options: options)
+    } catch {
+        return openAIError(for: error)
+    }
+    let resp = OpenAICompletionResponse(
+        id: id,
+        object: "text_completion",
+        created: Wire.nowEpoch(),
+        model: model,
+        choices: [OpenAICompletionChoice(
+            index: 0, text: prefix + cutAtStop(result.text, stops), finish_reason: FinishReason.stop
+        )],
+        usage: OpenAIUsage(
+            prompt_tokens: result.promptTokens,
+            completion_tokens: result.completionTokens
+        )
+    )
+    return try jsonResponse(resp)
+}
+
+/// Fields that would change the shape of the answer are refused, not ignored: one on-device
+/// generation is one completion without token probabilities, and a client that asked for more
+/// should hear so instead of quietly receiving less. Fields that only nudge sampling and have
+/// no counterpart in `GenerationOptions` stay ignored, as on the chat route.
+private func unsupportedCompletionField(_ body: OpenAICompletionRequest) -> Response? {
+    if let n = body.n, n > 1 {
+        return openAIFieldError(
+            "n > 1 is not supported — one request yields exactly one completion", field: "n"
+        )
+    }
+    if let bestOf = body.best_of, bestOf > 1 {
+        return openAIFieldError(
+            "best_of > 1 is not supported — candidates cannot be ranked without token probabilities",
+            field: "best_of"
+        )
+    }
+    if body.logprobs != nil {
+        return openAIFieldError(
+            "logprobs is not supported — FoundationModels does not expose token probabilities",
+            field: "logprobs"
+        )
+    }
+    return nil
+}
+
+/// Start of the earliest stop sequence in `text`, or `nil` if none of them occurs.
+private func firstStopIndex(in text: String, stops: [String]) -> String.Index? {
+    var earliest: String.Index?
+    for stop in stops {
+        guard let r = text.range(of: stop) else { continue }
+        if earliest == nil || r.lowerBound < earliest! { earliest = r.lowerBound }
+    }
+    return earliest
+}
+
+/// Cuts the completion before the first stop sequence, as OpenAI's route does; the sequence
+/// itself is not part of the answer.
+private func cutAtStop(_ text: String, _ stops: [String]) -> String {
+    guard let cut = firstStopIndex(in: text, stops: stops) else { return text }
+    return String(text[..<cut])
+}
+
+/// Streaming counterpart of `cutAtStop`. Holds back the tail that could still grow into a stop
+/// sequence, so a sequence split across two deltas is not emitted by halves.
+private struct StopSequenceCutter {
+    private let stops: [String]
+    private var buffer = ""
+    private(set) var isDone = false
+
+    init(_ stops: [String]) { self.stops = stops }
+
+    mutating func feed(_ delta: String) -> String {
+        if isDone { return "" }
+        if stops.isEmpty { return delta }
+        buffer += delta
+        if let cut = firstStopIndex(in: buffer, stops: stops) {
+            let out = String(buffer[..<cut])
+            buffer = ""
+            isDone = true
+            return out
+        }
+        let hold = heldSuffixLength()
+        let idx = buffer.index(buffer.endIndex, offsetBy: -hold)
+        let out = String(buffer[..<idx])
+        buffer = String(buffer[idx...])
+        return out
+    }
+
+    mutating func flush() -> String {
+        let out = isDone ? "" : buffer
+        buffer = ""
+        return out
+    }
+
+    /// Longest suffix of the buffer that is still a prefix of some stop sequence.
+    private func heldSuffixLength() -> Int {
+        let longest = stops.map(\.count).max() ?? 0
+        var k = Swift.min(buffer.count, longest - 1)
+        while k > 0 {
+            let suffix = buffer.suffix(k)
+            if stops.contains(where: { $0.hasPrefix(suffix) }) { return k }
+            k -= 1
+        }
+        return 0
+    }
+}
+
+/// The on-device model follows instructions; it has no fill-in-the-middle mode. A request
+/// that carries `suffix` — what editor clients send for inline completion — is therefore
+/// turned into an explicit instruction instead of being passed through as raw text.
+private func frameCompletionPrompt(_ body: OpenAICompletionRequest) -> (system: String?, prompt: String) {
+    let text = body.prompt?.text ?? ""
+    guard let suffix = body.suffix, !suffix.isEmpty else {
+        return (nil, text)
+    }
+    let system = """
+        Complete the text at the cursor. Answer with the missing passage only — \
+        no explanation, and do not repeat the text around the cursor.
+        """
+    return (system, "[Before the cursor]\n\(text)\n\n[After the cursor]\n\(suffix)")
+}
+
+private func openAICompletionStreamResponse(
+    id: String, model: String, prompt: String, echo: String, stops: [String],
+    options: BridgeOptions
+) -> Response {
+    let created = Wire.nowEpoch()
+    let stream = AsyncThrowingStream<ByteBuffer, Error> { continuation in
+        let task = Task {
+            func chunk(_ text: String, finish: String?) -> OpenAICompletionChunk {
+                OpenAICompletionChunk(
+                    id: id, object: "text_completion",
+                    created: created, model: model,
+                    choices: [OpenAICompletionChoice(index: 0, text: text, finish_reason: finish)]
+                )
+            }
+            do {
+                if !echo.isEmpty {
+                    continuation.yield(try sse(chunk(echo, finish: nil)))
+                }
+                var cutter = StopSequenceCutter(stops)
+                for try await delta in ModelBridge.stream(prompt: prompt, options: options) {
+                    let text = cutter.feed(delta.textDelta)
+                    if !text.isEmpty {
+                        continuation.yield(try sse(chunk(text, finish: nil)))
+                    }
+                    if cutter.isDone { break }
+                }
+                let tail = cutter.flush()
+                if !tail.isEmpty {
+                    continuation.yield(try sse(chunk(tail, finish: nil)))
+                }
+                continuation.yield(try sse(chunk("", finish: FinishReason.stop)))
+                continuation.yield(sseTerminator)
+                continuation.finish()
+            } catch {
+                let failure = ModelBridge.classify(error)
+                let payload = ["error": [
+                    "message": failure.description,
+                    "type": failure.kind.openAIErrorType,
+                    "code": failure.kind.rawValue,
+                ]]
+                if let data = try? JSONSerialization.data(withJSONObject: payload),
+                   let s = String(data: data, encoding: .utf8) {
+                    continuation.yield(ByteBuffer(string: "data: \(s)\n\n"))
+                }
+                continuation.yield(sseTerminator)
+                continuation.finish()
+            }
+        }
+        continuation.onTermination = { _ in task.cancel() }
+    }
+    return Response(
+        status: .ok,
+        headers: [.contentType: "text/event-stream", .cacheControl: "no-cache"],
+        body: ResponseBody(asyncSequence: stream)
+    )
+}
+
 // MARK: - Encoding helpers
 
 private let sharedEncoder: JSONEncoder = {
@@ -604,6 +811,22 @@ private func ollamaError(_ message: String, status: HTTPResponse.Status) -> Resp
 private func ollamaError(for error: Error) -> Response {
     let failure = ModelBridge.classify(error)
     return ollamaError(failure.description, status: HTTPResponse.Status(code: failure.kind.httpStatusCode))
+}
+
+/// Refuses a request field OpenAI defines but this server cannot honour.
+private func openAIFieldError(_ message: String, field: String) -> Response {
+    let body = OpenAIErrorResponse(error: OpenAIErrorDetail(
+        message: message,
+        type: "invalid_request_error",
+        code: "unsupported_parameter",
+        param: field
+    ))
+    let data = (try? sharedEncoder.encode(body)) ?? Data("{\"error\":{\"message\":\"internal\"}}".utf8)
+    return Response(
+        status: .badRequest,
+        headers: [.contentType: "application/json"],
+        body: ResponseBody(byteBuffer: ByteBuffer(data: data))
+    )
 }
 
 /// Maps a generation failure to OpenAI's `{"error": {message, type, code}}` body.
