@@ -40,8 +40,13 @@ into an explicit fill-in instruction for the model.**
    before and after the cursor is labelled and a short system instruction asks for the
    missing passage only
 4. Responses use `"object": "text_completion"`, streaming emits the same object per
-   SSE frame and closes with a `finish_reason` frame and `data: [DONE]`
-5. Failures reuse `openAIError(for:)`, so the status and error body match the chat route
+   SSE frame and closes with a `finish_reason` frame and `data: [DONE]`. Every choice
+   carries `logprobs` and `finish_reason` as keys, `null` where there is nothing to
+   report, because OpenAI's schema lists both as required
+5. `stop` cuts the completion before the first sequence, streaming included — the
+   cutter holds back a tail that could still grow into a sequence, so one split across
+   two deltas is not emitted by halves
+6. Failures reuse `openAIError(for:)`, so the status and error body match the chat route
 
 ## Rationale
 
@@ -51,7 +56,15 @@ into an explicit fill-in instruction for the model.**
 
 ## Consequences
 
-- `n`, `stop`, `logprobs` and `best_of` are accepted and ignored, as on the chat route
+- A field that would change the shape of the answer is refused with 400 and
+  `code: "unsupported_parameter"` naming it: `n` and `best_of` above 1, and `logprobs`.
+  One on-device generation is one completion, and the framework exposes no token
+  probabilities — a client that asked for more should hear that rather than quietly
+  receive less. Fields that only nudge sampling and have no counterpart in
+  `GenerationOptions` (`frequency_penalty`, `presence_penalty`, `logit_bias`, `user`)
+  stay ignored, as on the chat route
+- The chat route keeps its own, older handling of `n` and `stop`; aligning it is a
+  separate change
 - Suggestion quality is bounded by a ~3B instruction model — the format is compatible,
   the model is not a code-completion model
 - Like `/v1/chat/completions`, the route always answers from Apple Intelligence; it is

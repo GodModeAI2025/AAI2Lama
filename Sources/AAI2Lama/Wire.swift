@@ -280,6 +280,15 @@ struct OpenAIErrorDetail: Codable {
     let message: String
     let type: String
     let code: String?
+    /// The offending request field, when the failure is about one. OpenAI clients show it.
+    let param: String?
+
+    init(message: String, type: String, code: String?, param: String? = nil) {
+        self.message = message
+        self.type = type
+        self.code = code
+        self.param = param
+    }
 }
 
 struct OpenAIMessage: Codable {
@@ -422,6 +431,27 @@ enum CompletionPrompt: Decodable {
     }
 }
 
+/// `stop` accepts a single sequence or a list of them.
+enum StopSequences: Decodable {
+    case single(String)
+    case list([String])
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if let s = try? c.decode(String.self) { self = .single(s); return }
+        if let a = try? c.decode([String].self) { self = .list(a); return }
+        throw DecodingError.dataCorruptedError(in: c, debugDescription: "Expected string or [string]")
+    }
+
+    /// Empty sequences would cut every completion to nothing, so they are dropped.
+    var values: [String] {
+        switch self {
+        case .single(let s): return s.isEmpty ? [] : [s]
+        case .list(let a): return a.filter { !$0.isEmpty }
+        }
+    }
+}
+
 struct OpenAICompletionRequest: Decodable {
     let model: String?
     let prompt: CompletionPrompt?
@@ -431,15 +461,32 @@ struct OpenAICompletionRequest: Decodable {
     let top_p: Double?
     let max_tokens: Int?
     let seed: Int?
-    let stop: JSONValue?
+    let stop: StopSequences?
     let n: Int?
+    let best_of: Int?
+    let logprobs: Int?
     let echo: Bool?
 }
 
+/// OpenAI's completion choice always carries `logprobs` and `finish_reason`, `null` where
+/// there is nothing to report — strictly typed clients expect both keys to be present.
 struct OpenAICompletionChoice: Codable {
     let index: Int
     let text: String
     let finish_reason: String?
+
+    /// Separate from the synthesised decoding keys: `logprobs` has no stored counterpart.
+    private enum WireKey: String, CodingKey {
+        case index, text, logprobs, finish_reason
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: WireKey.self)
+        try c.encode(index, forKey: .index)
+        try c.encode(text, forKey: .text)
+        try c.encodeNil(forKey: .logprobs)
+        try c.encode(finish_reason, forKey: .finish_reason)
+    }
 }
 
 struct OpenAICompletionResponse: ResponseCodable {

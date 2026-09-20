@@ -152,6 +152,11 @@ curl -X POST http://127.0.0.1:11435/v1/completions \
   -d '{"prompt":"func add(a: Int, b: Int) -> Int {\n    ","suffix":"\n}"}'
 ```
 
+`stop` is honoured in both modes and cuts the completion before the first sequence.
+`n` and `best_of` above 1 and `logprobs` are refused with a 400 naming the field, because
+one on-device generation is one completion and the framework reports no token
+probabilities — better a clear error than a quietly shortened answer.
+
 Expect an instruction-tuned ~3B model, not a code-completion model — the format is
 compatible, the suggestions are as good as Apple Intelligence gets.
 
